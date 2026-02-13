@@ -8,6 +8,7 @@ const { createJob } = require('./tools/create-job');
 const { loadCrons } = require('./cron');
 const { loadTriggers } = require('./triggers');
 const { setWebhook, sendMessage, formatJobNotification, downloadFile, reactToMessage, startTypingIndicator } = require('./tools/telegram');
+const { verifySlackSignature, sendMessage: sendSlackMessage, sendThreadMessage, addReaction, formatJobNotification: formatSlackJobNotification, startTypingIndicator: slackTypingIndicator } = require('./tools/slack');
 const { isWhisperEnabled, transcribeAudio } = require('./tools/openai');
 const { chat } = require('./claude');
 const { toolDefinitions, toolExecutors } = require('./claude/tools');
@@ -19,15 +20,28 @@ const { render_md } = require('./utils/render-md');
 const app = express();
 
 app.use(helmet());
+
+// Capture raw body for Slack signature verification
+app.use((req, res, next) => {
+  let rawBody = '';
+  req.on('data', chunk => {
+    rawBody += chunk.toString();
+  });
+  req.on('end', () => {
+    req.rawBody = rawBody;
+    next();
+  });
+});
+
 app.use(express.json());
 
-const { API_KEY, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN, GH_WEBHOOK_SECRET, GH_OWNER, GH_REPO, TELEGRAM_CHAT_ID, TELEGRAM_VERIFICATION } = process.env;
+const { API_KEY, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_BOT_TOKEN, GH_WEBHOOK_SECRET, GH_OWNER, GH_REPO, TELEGRAM_CHAT_ID, TELEGRAM_VERIFICATION, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_CHANNEL_ID } = process.env;
 
 // Bot token from env, can be overridden by /telegram/register
 let telegramBotToken = TELEGRAM_BOT_TOKEN || null;
 
 // Routes that have their own authentication
-const PUBLIC_ROUTES = ['/telegram/webhook', '/github/webhook'];
+const PUBLIC_ROUTES = ['/telegram/webhook', '/github/webhook', '/slack/webhook'];
 
 // Global x-api-key auth (skip for routes with their own auth)
 app.use((req, res, next) => {
@@ -179,6 +193,83 @@ app.post('/telegram/webhook', async (req, res) => {
   }
 });
 
+// POST /slack/webhook - receive Slack events
+app.post('/slack/webhook', async (req, res) => {
+  // Validate Slack signature
+  const timestamp = req.headers['x-slack-request-timestamp'];
+  const signature = req.headers['x-slack-request-signature'];
+  const rawBody = req.rawBody || JSON.stringify(req.body);
+
+  if (SLACK_SIGNING_SECRET && !verifySlackSignature(rawBody, timestamp, signature, SLACK_SIGNING_SECRET)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const event = req.body;
+
+  // Handle URL verification challenge
+  if (event.type === 'url_verification') {
+    return res.json({ challenge: event.challenge });
+  }
+
+  // Handle events
+  if (event.type === 'event_callback') {
+    const slackEvent = event.event;
+
+    // Handle app_mention events
+    if (slackEvent.type === 'app_mention' && SLACK_CHANNEL_ID && SLACK_BOT_TOKEN) {
+      const userId = slackEvent.user;
+      const channelId = slackEvent.channel;
+      const threadTs = slackEvent.thread_ts || slackEvent.ts;
+
+      // Only respond if mentioned in the configured channel or in a thread from that channel
+      if (channelId !== SLACK_CHANNEL_ID && !slackEvent.thread_ts) {
+        return res.status(200).json({ ok: true });
+      }
+
+      // Extract message text (remove bot mention)
+      let messageText = slackEvent.text || '';
+      messageText = messageText.replace(/<@[A-Z0-9]+>/g, '').trim();
+
+      if (!messageText) {
+        res.status(200).json({ ok: true });
+        return;
+      }
+
+      // Acknowledge immediately
+      res.status(200).json({ ok: true });
+
+      try {
+        // Add reaction
+        await addReaction(SLACK_BOT_TOKEN, channelId, slackEvent.ts);
+
+        // Get conversation history and process with Claude
+        const history = getHistory(channelId);
+        const { response, history: newHistory } = await chat(
+          messageText,
+          history,
+          toolDefinitions,
+          toolExecutors
+        );
+        updateHistory(channelId, newHistory);
+
+        // Send response in thread
+        const chunks = require('./tools/slack').smartSplit(response);
+        for (const chunk of chunks) {
+          await sendThreadMessage(SLACK_BOT_TOKEN, channelId, threadTs, chunk);
+        }
+      } catch (err) {
+        console.error('Failed to process Slack message:', err);
+        await sendThreadMessage(SLACK_BOT_TOKEN, channelId, threadTs, 'Sorry, I encountered an error processing your message.').catch(() => {});
+      }
+    }
+
+    // Always acknowledge receipt
+    res.status(200).json({ ok: true });
+  } else {
+    res.status(200).json({ ok: true });
+  }
+});
+
 /**
  * Extract job ID from branch name (e.g., "job/abc123" -> "abc123")
  */
@@ -267,8 +358,8 @@ app.post('/github/webhook', async (req, res) => {
   const jobId = extractJobId(branchName);
   if (!jobId) return res.status(200).json({ ok: true, skipped: true, reason: 'not a job branch' });
 
-  if (!TELEGRAM_CHAT_ID || !telegramBotToken) {
-    console.log(`Job ${jobId} completed but no chat ID to notify`);
+  if ((!TELEGRAM_CHAT_ID || !telegramBotToken) && (!SLACK_CHANNEL_ID || !SLACK_BOT_TOKEN)) {
+    console.log(`Job ${jobId} completed but no chat to notify`);
     return res.status(200).json({ ok: true, skipped: true, reason: 'no chat to notify' });
   }
 
@@ -278,15 +369,38 @@ app.post('/github/webhook', async (req, res) => {
     results.pr_url = pr.html_url;
 
     const message = await summarizeJob(results);
+    const success = (results.merge_result || '').includes('success');
 
-    await sendMessage(telegramBotToken, TELEGRAM_CHAT_ID, message);
+    // Notify Telegram if configured
+    if (TELEGRAM_CHAT_ID && telegramBotToken) {
+      await sendMessage(telegramBotToken, TELEGRAM_CHAT_ID, message);
 
-    // Add the summary to chat memory so Claude has context in future conversations
-    const history = getHistory(TELEGRAM_CHAT_ID);
-    history.push({ role: 'assistant', content: message });
-    updateHistory(TELEGRAM_CHAT_ID, history);
+      // Add the summary to chat memory so Claude has context in future conversations
+      const history = getHistory(TELEGRAM_CHAT_ID);
+      history.push({ role: 'assistant', content: message });
+      updateHistory(TELEGRAM_CHAT_ID, history);
 
-    console.log(`Notified chat ${TELEGRAM_CHAT_ID} about job ${jobId.slice(0, 8)}`);
+      console.log(`Notified Telegram chat ${TELEGRAM_CHAT_ID} about job ${jobId.slice(0, 8)}`);
+    }
+
+    // Notify Slack if configured
+    if (SLACK_CHANNEL_ID && SLACK_BOT_TOKEN) {
+      const slackMessage = formatSlackJobNotification({
+        jobId,
+        success,
+        summary: message,
+        prUrl: pr.html_url,
+      });
+
+      await sendSlackMessage(SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, slackMessage);
+
+      // Add the summary to chat memory so Claude has context in future conversations
+      const history = getHistory(SLACK_CHANNEL_ID);
+      history.push({ role: 'assistant', content: message });
+      updateHistory(SLACK_CHANNEL_ID, history);
+
+      console.log(`Notified Slack channel ${SLACK_CHANNEL_ID} about job ${jobId.slice(0, 8)}`);
+    }
 
     res.status(200).json({ ok: true, notified: true });
   } catch (err) {
