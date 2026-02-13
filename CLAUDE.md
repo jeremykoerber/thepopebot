@@ -84,7 +84,8 @@ thepopebot is a **template repository** for creating custom autonomous AI agents
 │   └── tools/
 │       ├── create-job.js       # Job creation via GitHub API
 │       ├── github.js           # GitHub REST API helper + job status
-│       └── telegram.js         # Telegram bot integration
+│       ├── telegram.js         # Telegram bot integration
+│       └── slack.js            # Slack bot integration
 ├── operating_system/
 │   ├── SOUL.md                 # Agent identity and personality
 │   ├── CHATBOT.md              # Telegram chat system prompt
@@ -124,6 +125,7 @@ The Event Handler is a Node.js Express server that provides orchestration capabi
 | `/webhook` | POST | Generic webhook for job creation (requires API_KEY) |
 | `/telegram/webhook` | POST | Telegram bot webhook for conversational interface |
 | `/telegram/register` | POST | Register Telegram webhook URL |
+| `/slack/webhook` | POST | Slack bot webhook for events and mentions |
 | `/github/webhook` | POST | Receives notifications from GitHub Actions (update-event-handler.yml) |
 | `/jobs/status` | GET | Check status of a running job |
 
@@ -306,6 +308,9 @@ Both `job` and `command` strings support the same templates:
 | `PORT` | Server port (default: 3000) | No |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from BotFather | For Telegram |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret for webhook validation | No |
+| `SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) from OAuth | For Slack |
+| `SLACK_SIGNING_SECRET` | Slack signing secret for webhook verification | For Slack |
+| `SLACK_CHANNEL_ID` | Slack channel ID for notifications and chat | For Slack |
 | `GH_WEBHOOK_SECRET` | Secret for GitHub Actions webhook auth | For notifications |
 | `ANTHROPIC_API_KEY` | Claude API key for chat functionality | For chat |
 | `EVENT_HANDLER_MODEL` | Claude model for chat (default: claude-sonnet-4) | No |
